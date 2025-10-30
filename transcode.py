@@ -428,8 +428,9 @@ def transcode_release(flac_dir, output_dir, output_format, max_threads=None):
 
 def make_torrent(input_dir, output_dir, tracker, passkey, source):
     torrent = os.path.join(output_dir, os.path.basename(input_dir)) + ".torrent"
-    if not os.path.exists(os.path.dirname(torrent)):
-        os.path.makedirs(os.path.dirname(torrent))
+    torrent_dir = os.path.dirname(torrent)
+    if torrent_dir and not os.path.exists(torrent_dir):
+        os.makedirs(torrent_dir, exist_ok=True)
     tracker_url = '{tracker}{passkey}/announce'.format(
         tracker=tracker, passkey=passkey)
     if source == None:

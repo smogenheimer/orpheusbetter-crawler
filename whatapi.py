@@ -167,6 +167,17 @@ class WhatAPI:
         self.last_request = time.time()
         return r.text
 
+    def search_torrents(self, searchstr=None, artistname=None, groupname=None):
+        """Search the tracker for torrents matching the provided query."""
+        params = {}
+        if searchstr:
+            params['searchstr'] = searchstr
+        if artistname:
+            params['artistname'] = artistname
+        if groupname:
+            params['groupname'] = groupname
+        return self.request('browse', **params)
+
     def get_candidates(self, mode, skip=None, media=lossless_media):
         if not media.issubset(lossless_media):
             raise ValueError('Unsupported media type {0}'.format((media - lossless_media).pop()))

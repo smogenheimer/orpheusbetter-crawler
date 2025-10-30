@@ -14,6 +14,8 @@ from multiprocessing import cpu_count
 import tagging
 import transcode
 import whatapi
+from mutagen import MutagenError
+from mutagen.flac import FLAC
 from _version import __version__
 
 if sys.version_info < (3, 6, 0):
@@ -56,6 +58,127 @@ def formats_needed(group, torrent, supported_formats):
     allowed_formats = whatapi.allowed_transcodes(torrent)
     return [format for format in missing_formats if format in allowed_formats]
 
+
+def _iter_flac_directories(root):
+    root = os.path.abspath(root)
+    for current, dirs, files in os.walk(root):
+        flacs = [os.path.join(current, f) for f in files if f.lower().endswith('.flac')]
+        if flacs:
+            yield current, sorted(flacs)
+            dirs[:] = []
+
+
+def _read_album_metadata(sample_file):
+    audio = FLAC(sample_file)
+    album = audio.get('album', [None])[0]
+    artist = audio.get('albumartist', audio.get('artist', [None]))[0]
+    return artist, album
+
+
+def _validate_album(flac_files):
+    allowed_sample_rates = {44100, 48000, 88200, 96000, 176400, 192000}
+    errors = []
+    sample_rates = set()
+    bit_depths = set()
+    for path in flac_files:
+        try:
+            audio = FLAC(path)
+        except MutagenError as exc:
+            errors.append('Failed to read metadata from {0}: {1}'.format(path, exc))
+            continue
+        for required in ('title', 'tracknumber'):
+            if required not in audio:
+                errors.append('Missing required tag "{0}" in {1}'.format(required, path))
+        sample_rates.add(audio.info.sample_rate)
+        bit_depths.add(audio.info.bits_per_sample)
+        if audio.info.sample_rate not in allowed_sample_rates:
+            errors.append('Unsupported sample rate {0}Hz in {1}'.format(audio.info.sample_rate, path))
+        if audio.info.bits_per_sample > 24:
+            errors.append('Unsupported bit depth {0}bit in {1}'.format(audio.info.bits_per_sample, path))
+
+    if len(sample_rates) > 1:
+        errors.append('Mixed sample rates detected: {0}'.format(', '.join(map(str, sample_rates))))
+    if len(bit_depths) > 1:
+        errors.append('Mixed bit depths detected: {0}'.format(', '.join(map(str, bit_depths))))
+    return errors
+
+
+def _album_already_on_tracker(api, artist, album):
+    if not artist or not album:
+        return False
+    query = '{0} {1}'.format(artist, album)
+    try:
+        response = api.search_torrents(searchstr=query)
+    except whatapi.RequestException:
+        print('Tracker search failed for {0} - {1}; skipping upload candidate.'.format(artist, album))
+        return True
+    for result in response.get('results', []):
+        group_name = result.get('groupName') or ''
+        if group_name.lower() != album.lower():
+            continue
+        names = set()
+        if 'artist' in result and result['artist']:
+            names.add(result['artist'])
+        for role_artists in result.get('groupArtists', {}).values():
+            for entry in role_artists:
+                name = entry.get('name')
+                if name:
+                    names.add(name)
+        normalized = {n.lower() for n in names}
+        if artist.lower() not in normalized:
+            continue
+        for torrent in result.get('torrents', []):
+            if torrent.get('format') == 'FLAC':
+                return True
+    return False
+
+
+def scan_library_for_missing_uploads(api, library_root, torrent_output, tracker, source, first_only=False):
+    created = []
+    library_root = os.path.abspath(library_root)
+    if not os.path.isdir(library_root):
+        print('Library path {0} does not exist or is not a directory.'.format(library_root))
+        return created
+
+    os.makedirs(torrent_output, exist_ok=True)
+
+    for directory, flac_files in _iter_flac_directories(library_root):
+        rel_path = os.path.relpath(directory, library_root)
+        try:
+            artist, album = _read_album_metadata(flac_files[0])
+        except MutagenError as exc:
+            print('Skipping {0}: unable to read tags ({1}).'.format(rel_path, exc))
+            continue
+        if not artist or not album:
+            print('Skipping {0}: missing artist or album tags.'.format(rel_path))
+            continue
+
+        rule_issues = _validate_album(flac_files)
+        if rule_issues:
+            print('Skipping {0} due to rule compliance issues:'.format(rel_path))
+            for issue in rule_issues:
+                print('  - {0}'.format(issue))
+            continue
+
+        if _album_already_on_tracker(api, artist, album):
+            continue
+
+        print('Found upload candidate: {0} - {1} ({2})'.format(artist, album, rel_path))
+        if first_only:
+            created.append((rel_path, None))
+            print('First-only mode enabled; stopping before torrent creation.')
+            break
+
+        try:
+            torrent_path = transcode.make_torrent(directory, torrent_output, tracker, api.passkey, source)
+        except Exception as exc:
+            print('Failed to create torrent for {0}: {1}'.format(rel_path, exc))
+            continue
+
+        created.append((rel_path, torrent_path))
+
+    return created
+
 def main():
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter, prog='orpheusbetter')
     parser.add_argument('release_urls', nargs='*', help='the URL where the release is located')
@@ -73,6 +196,9 @@ def main():
     parser.add_argument('-S', '--skip', action='store_true', help="treats a torrent as already processed")
     parser.add_argument('-t', '--totp', help="time based one time password for 2FA", default=None)
     parser.add_argument('-o', '--source', help="the value to put in the source flag in created torrents")
+    parser.add_argument('--scan-library', help='recursively scan a directory for FLAC albums that need uploading')
+    parser.add_argument('--scan-output', help='directory where generated .torrent files are stored when scanning')
+    parser.add_argument('--scan-first-only', action='store_true', help='stop after the first eligible album is discovered without creating a torrent')
 
     args = parser.parse_args()
 
@@ -165,11 +291,44 @@ def main():
         source = None
         if config.has_option('orpheus', 'source'):
             source = config.get('orpheus', 'source')
+        if args.source:
+            source = args.source
 
     upload_torrent = not args.no_upload
 
     print("Logging in to Orpheus Network...")
     api = whatapi.WhatAPI(username, password, endpoint, args.totp)
+
+    if args.scan_library:
+        library_path = os.path.expanduser(args.scan_library)
+        scan_output = os.path.expanduser(args.scan_output) if args.scan_output else torrent_dir
+        created = scan_library_for_missing_uploads(
+            api,
+            library_path,
+            scan_output,
+            tracker,
+            source,
+            first_only=args.scan_first_only
+        )
+        summary_path = os.path.join(scan_output, 'created_torrents.txt')
+        summary_dir = os.path.dirname(summary_path)
+        if summary_dir:
+            os.makedirs(summary_dir, exist_ok=True)
+        with open(summary_path, 'w', encoding='utf-8') as summary:
+            if args.scan_first_only:
+                summary.write('# First-only scan mode.\n')
+                if created:
+                    for rel_path, _ in created:
+                        summary.write('{0} -> pending\n'.format(rel_path))
+                else:
+                    summary.write('No eligible albums discovered.\n')
+            elif created:
+                for rel_path, torrent_path in created:
+                    summary.write('{0} -> {1}\n'.format(rel_path, torrent_path))
+            else:
+                summary.write('# No torrents created during scan.\n')
+        print('Library scan complete. Summary written to {0}'.format(summary_path))
+        return
 
     try:
         seen = pickle.load(open(args.cache, 'rb'))
